@@ -35,6 +35,15 @@ try:
 except ImportError as e:
     logger.warning(f"New services not available: {str(e)}")
     NEW_SERVICES_AVAILABLE = False
+
+# Attempt to import ObjectId for sanitization
+try:
+    from bson.objectid import ObjectId
+    BSON_AVAILABLE = True
+except ImportError:
+    ObjectId = None # Fallback if bson is not available
+    BSON_AVAILABLE = False
+    logger.warning("bson.objectid.ObjectId not found. ObjectId sanitization will not be available.")
     
 # Initialize services
 hr_service = HRService()
@@ -252,6 +261,19 @@ def initialize_new_services():
         logger.error(f"Failed to initialize new services: {str(e)}")
         return False
 
+def sanitize_for_json(data: Any) -> Any:
+    """Recursively sanitize data for JSON serialization."""
+    if isinstance(data, dict):
+        return {key: sanitize_for_json(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_for_json(item) for item in data]
+    elif BSON_AVAILABLE and isinstance(data, ObjectId):
+        return str(data)
+    elif isinstance(data, datetime):
+        return data.isoformat()
+    # Add other type conversions as needed (e.g., Decimal to str or float)
+    return data
+
 # Function to handle tool calls made by the assistant
 def handle_tool_calls(required_action):
     """Process tool calls from the assistant and return results"""
@@ -345,9 +367,10 @@ def handle_tool_calls(required_action):
             }
 
         # Add the result to tool outputs
+        sanitized_result = sanitize_for_json(result)
         tool_outputs.append({
             "tool_call_id": tool_call.id,
-            "output": json.dumps(result)
+            "output": json.dumps(sanitized_result)
         })
 
     return tool_outputs

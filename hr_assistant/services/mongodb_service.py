@@ -7,6 +7,7 @@ try:
     from pymongo import MongoClient
     from pymongo.collection import Collection
     from pymongo.database import Database
+    from bson.objectid import ObjectId  # Added import
     MONGODB_AVAILABLE = True
 except ImportError:
     logger.error("pymongo not installed. Install with: pip install pymongo")
@@ -15,6 +16,16 @@ except ImportError:
 
 class MongoDBService:
     """Service for MongoDB operations with fallback functionality"""
+
+    def _convert_objectid_to_str(self, data: Any) -> Any:
+        """Recursively convert ObjectId to string in dicts and lists."""
+        if isinstance(data, dict):
+            return {key: self._convert_objectid_to_str(value) for key, value in data.items()}
+        elif isinstance(data, list):
+            return [self._convert_objectid_to_str(item) for item in data]
+        elif MONGODB_AVAILABLE and isinstance(data, ObjectId):
+            return str(data)
+        return data
 
     def __init__(self):
         self.client: Optional[MongoClient] = None
@@ -83,7 +94,7 @@ class MongoDBService:
             result = self.employees_collection.find_one(query)
             if result:
                 logger.info(f"Found employee by ID: {employee_id}")
-                return result
+                return self._convert_objectid_to_str(result)  # Apply conversion
             else:
                 logger.warning(f"No employee found with ID: {employee_id}")
                 return None
@@ -108,7 +119,7 @@ class MongoDBService:
                 if results:
                     logger.info(
                         f"Text search for '{search_text}' returned {len(results)} results")
-                    return results
+                    return [self._convert_objectid_to_str(item) for item in results]  # Apply conversion
             except Exception:
                 # Text index might not exist, fall back to regex search
                 pass
@@ -130,7 +141,7 @@ class MongoDBService:
                 regex_query).limit(limit))
             logger.info(
                 f"Regex search for '{search_text}' returned {len(results)} results")
-            return results
+            return [self._convert_objectid_to_str(item) for item in results]  # Apply conversion
 
         except Exception as e:
             logger.error(f"Error in text search for '{search_text}': {str(e)}")
@@ -183,7 +194,7 @@ class MongoDBService:
 
             results = list(self.employees_collection.find(query).limit(limit))
             logger.info(f"Criteria search returned {len(results)} results")
-            return results
+            return [self._convert_objectid_to_str(item) for item in results]  # Apply conversion
 
         except Exception as e:
             logger.error(f"Error in criteria search: {str(e)}")
