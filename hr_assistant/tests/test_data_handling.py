@@ -303,6 +303,192 @@ def test_self_query_uses_requester_id(
     assert len(result["data"]) == 1
     assert result["data"][0]["_id"] == requester_id
 
+
+@patch('hr_assistant.modules.employee.MONGODB_AVAILABLE', True)
+@patch('hr_assistant.modules.employee.VECTOR_SEARCH_AVAILABLE', False)
+@patch('hr_assistant.modules.employee.QUERY_PARSER_AVAILABLE', False) # Force simple_query_parse
+@patch('hr_assistant.modules.employee.mongodb_service')
+def test_query_targets_other_user_not_requester(
+    mock_employee_mongo_service,
+    mock_qps_available_false, # Parameters to match decorator order
+    mock_vs_available_false,
+    mock_mongo_available_true
+    ):
+    from hr_assistant.modules.employee import get_employee_data_tool, initialize_services
+    initialize_services()
+
+    requester_id = "EMP103" # Nasar
+    query = "Show Ann's salary details" # Ann is the target
+
+    # Mock for _get_requester_info
+    mock_employee_mongo_service.get_employee_by_id.return_value = {
+        "_id": requester_id, "firstName": "Nasar", "lastName": "Ali",
+        "employeeInfo": [{"grade": "L7", "depName": "Engineering"}], "role": "Manager"
+    }
+
+    # Mock for _execute_search_with_fallbacks (searching for Ann)
+    # This mock will be used when searching by name "Ann"
+    mock_ann_data = {
+        "_id": "EMP104", "firstName": "Ann", "lastName": "Other",
+        "employeeInfo": [{"grade": "L5", "depName": "HR"}], "role": "Specialist",
+        # Salary info should be filtered by AccessControlMatrix later if restricted
+        "salaryInfo": {"baseSalary": "50000", "currency": "USD"}
+    }
+    # Simulate search_employees_by_criteria finding "Ann"
+    mock_employee_mongo_service.search_employees_by_criteria.return_value = [mock_ann_data]
+    # Also mock search_employees_by_text as a fallback for _execute_search_with_fallbacks
+    mock_employee_mongo_service.search_employees_by_text.return_value = [mock_ann_data]
+
+
+    # Mock AccessControlMatrix to allow access for simplicity in this specific test focus
+    with patch('hr_assistant.modules.employee.AccessControlMatrix.can_access_employee', return_value=True), \
+         patch('hr_assistant.modules.employee.AccessControlMatrix.filter_employee_data', side_effect=lambda grade, role, data: data):
+
+        result = get_employee_data_tool(query=query, requester_id=requester_id)
+
+    assert result["success"] is True
+    assert len(result["data"]) == 1
+    assert result["data"][0]["firstName"] == "Ann"
+
+    # Check that get_employee_by_id was called for requester_id (for _get_requester_info)
+    mock_employee_mongo_service.get_employee_by_id.assert_any_call(requester_id)
+
+    # Check that search_employees_by_criteria was called with name "Ann"
+    # (because _simple_query_parse should identify "Ann" as the name parameter)
+    # Depending on regex, "Ann's" might result in "Ann" or "Ann's".
+    # For `name_pattern_single = r'\b([A-Z][a-z]+)\b(?:(?:\'s)?|\s+(?:details|info|salary|data|for))'`
+    # it should extract "Ann".
+    mock_employee_mongo_service.search_employees_by_criteria.assert_any_call(
+        {"name": "Ann"} # Or whatever _simple_query_parse extracts for "Ann's"
+    )
+    # Or, if it fell back to text search:
+    # mock_employee_mongo_service.search_employees_by_text.assert_any_call(query)
+
+
+@patch('hr_assistant.modules.employee.MONGODB_AVAILABLE', True)
+@patch('hr_assistant.modules.employee.VECTOR_SEARCH_AVAILABLE', False)
+@patch('hr_assistant.modules.employee.QUERY_PARSER_AVAILABLE', False) # Force simple_query_parse
+@patch('hr_assistant.modules.employee.ACCESS_CONTROL_AVAILABLE', True) # Ensure AccessControlMatrix is used
+@patch('hr_assistant.modules.employee.mongodb_service')
+@patch('hr_assistant.modules.employee.AccessControlMatrix') # Mock the class itself
+def test_access_denied_message_for_specific_user(
+    MockAccessControlMatrix, # Class mock
+    mock_employee_mongo_service,
+    mock_ac_available, # Parameters to match decorator order
+    mock_qps_false,
+    mock_vs_false,
+    mock_mongo_true
+    ):
+    from hr_assistant.modules.employee import get_employee_data_tool, initialize_services
+    initialize_services()
+
+    requester_id = "EMP103"
+    target_employee_id = "EMP104"
+    query = f"Show salary for {target_employee_id}"
+
+    # Requester data (for _get_requester_info)
+    requester_data = {
+        "_id": requester_id, "firstName": "Nasar", "lastName": "Ali",
+        "employeeInfo": [{"grade": "L5", "depName": "Engineering"}], "role": "Engineer"
+    }
+    # Target employee data (found by _execute_search_with_fallbacks)
+    target_employee_data_full = {
+        "_id": target_employee_id, "firstName": "Target", "lastName": "User",
+        "employeeInfo": [{"grade": "L7", "depName": "Finance"}], "role": "Manager",
+        "salaryInfo": {"baseSalary": "100000"} # Sensitive data
+    }
+
+    # Configure mongodb_service mocks
+    def get_employee_by_id_side_effect(emp_id):
+        if emp_id == requester_id:
+            return requester_data
+        if emp_id == target_employee_id:
+            return target_employee_data_full
+        return None
+    mock_employee_mongo_service.get_employee_by_id.side_effect = get_employee_by_id_side_effect
+    if hasattr(mock_employee_mongo_service, 'get_employee_team_members'): # For _get_requester_info
+        mock_employee_mongo_service.get_employee_team_members.return_value = []
+
+
+    # Configure AccessControlMatrix mocks
+    # EMP103 can "see" EMP104 exists
+    MockAccessControlMatrix.can_access_employee.return_value = True
+    # But EMP103 cannot see EMP104's salary (filter_employee_data returns it empty or without salary)
+    MockAccessControlMatrix.filter_employee_data.return_value = {
+        "_id": target_employee_id, "firstName": "Target", "lastName": "User",
+        # No salaryInfo
+    }
+    # A more realistic filter_employee_data mock might check requested_fields, but for this test,
+    # simply returning data without salary (or empty if ALL requested fields are denied) is enough.
+    # Let's assume the query implies a request for all data, and salary is filtered out.
+    # For the message to be "access denied", _filter_employee_data must return *something* non-empty,
+    # but the *specific sensitive fields* like salary are not there.
+    # If _filter_employee_data returns an empty dict because ALL fields are inaccessible,
+    # then filtered_results will be empty.
+
+    # Re-check: The requirement is: "filtered_data = _filter_employee_data(...); if filtered_data: filtered_results.append(filtered_data)"
+    # "if not filtered_results: message = 'You do not have authorization...'"
+    # So, if filter_employee_data returns {}, filtered_results will be empty.
+    MockAccessControlMatrix.filter_employee_data.return_value = {} # Simulate all requested data is denied
+
+
+    result = get_employee_data_tool(query=query, requester_id=requester_id)
+
+    assert result["success"] is False
+    assert result["message"] == "You do not have authorization to access the requested information for the specified employee(s)."
+    assert result["query_info"]["parameters"].get("employee_id") == target_employee_id
+
+
+@patch('hr_assistant.modules.employee.MONGODB_AVAILABLE', True)
+@patch('hr_assistant.modules.employee.VECTOR_SEARCH_AVAILABLE', False)
+@patch('hr_assistant.modules.employee.QUERY_PARSER_AVAILABLE', False) # Force simple_query_parse
+@patch('hr_assistant.modules.employee.mongodb_service')
+def test_no_users_found_message(
+    mock_employee_mongo_service,
+    mock_qps_false, # Parameters to match decorator order
+    mock_vs_false,
+    mock_mongo_true
+    ):
+    from hr_assistant.modules.employee import get_employee_data_tool, initialize_services
+    initialize_services()
+
+    requester_id = "EMP103"
+    query = "Show details for NonExistentUserXYZ"
+
+    # Requester data for _get_requester_info
+    mock_employee_mongo_service.get_employee_by_id.return_value = {
+         "_id": requester_id, "firstName": "Nasar", "lastName": "Ali",
+        "employeeInfo": [{"grade": "L5", "depName": "Engineering"}], "role": "Engineer"
+    }
+    if hasattr(mock_employee_mongo_service, 'get_employee_team_members'):
+        mock_employee_mongo_service.get_employee_team_members.return_value = []
+
+    # Simulate no user found by any search method
+    mock_employee_mongo_service.search_employees_by_criteria.return_value = []
+    mock_employee_mongo_service.search_employees_by_text.return_value = []
+    # If get_employee_by_id was called for "NonExistentUserXYZ" (if it looked like an ID)
+    # we need a side effect for that too.
+    def get_by_id_side_effect_notfound(emp_id):
+        if emp_id == requester_id:
+            return { "_id": requester_id, "firstName": "Nasar"} # Min data for requester
+        return None # Not found for any other ID
+    mock_employee_mongo_service.get_employee_by_id.side_effect = get_by_id_side_effect_notfound
+
+
+    result = get_employee_data_tool(query=query, requester_id=requester_id)
+
+    assert result["success"] is False
+    assert result["message"] == "No employees found matching your query."
+    # Check that _simple_query_parse likely set "NonExistentUserXYZ" as a name if not an ID
+    # This depends on the regex in _simple_query_parse.
+    # For "NonExistentUserXYZ", it might be caught by `r'\b([A-Z]+\d+[A-Z]*)\b'` if it looked like an ID,
+    # or by name patterns if not.
+    # Example: if it was parsed as a name:
+    # assert result["query_info"]["parameters"].get("name") == "NonExistentUserXYZ"
+    # Or if it was parsed as an ID:
+    # assert result["query_info"]["parameters"].get("employee_id") == "NonExistentUserXYZ"
+    # For this test, the message is the key part.
+
 # To run these tests, you would typically use pytest from your terminal:
 # pytest hr_assistant/tests/test_data_handling.py
 # Ensure that PYTHONPATH is set up correctly if running from a different directory,

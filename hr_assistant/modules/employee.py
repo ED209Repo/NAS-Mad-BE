@@ -113,8 +113,12 @@ def get_employee_data_tool(query: str, requester_id: str = None) -> Dict[str, An
         if not search_results:
             return {
                 "success": False,
-                "message": "No employees found matching your query",
-                "query_parsed": parsed_query
+                "message": "No employees found matching your query.", # Added period
+                "query_info": { # Consistent key name for parsed query info
+                    "intent": parsed_query.get("intent", "unknown"),
+                    "confidence": parsed_query.get("confidence", 0.5),
+                    "parameters": parsed_query.get("parameters", {})
+                }
             }
 
         # Apply access control if available
@@ -130,9 +134,18 @@ def get_employee_data_tool(query: str, requester_id: str = None) -> Dict[str, An
                     filtered_results.append(filtered_data)
 
         if not filtered_results:
+            # If search_results was populated but filtered_results is empty,
+            # it means access was denied to all found records.
+            message = "You do not have authorization to access the requested information for the specified employee(s)."
+
             return {
                 "success": False,
-                "message": "You don't have permission to access the requested employee information"
+                "message": message,
+                "query_info": {
+                    "intent": parsed_query.get("intent", "unknown"),
+                    "confidence": parsed_query.get("confidence", 0.5),
+                    "parameters": parsed_query.get("parameters", {})
+                }
             }
 
         # Format response
@@ -168,36 +181,78 @@ def _simple_query_parse(query: str, requester_id: str = None) -> Dict[str, Any]:
         "intent": "get_employee_info",
         "parameters": {},
         "data_requested": [],
-        "confidence": 0.5
+        "confidence": 0.5  # Default confidence
     }
 
-    # Look for employee IDs (various formats)
-    employee_id_patterns = [
-        r'\b[A-Z]{2,4}\d{2,4}\b',  # ABC123, XYZ1234, etc.
-        r'\bEMP\d{2,4}\b',         # EMP123, EMP1234
-        r'\b[A-Z]+\d+[A-Z]*\b'    # Generic alphanumeric IDs
-    ]
+    target_identified = False
 
+    # 1. Look for explicit employee IDs first
+    employee_id_patterns = [
+        r'\b([A-Z]{2,4}\d{2,4})\b',  # ABC123, XYZ1234 (capture group for the ID itself)
+        r'\b(EMP\d{2,4})\b',         # EMP123, EMP1234
+        r'\b([A-Z]+\d+[A-Z]*)\b'     # Generic alphanumeric IDs like QTG1001NAS
+    ]
     for pattern in employee_id_patterns:
         matches = re.findall(pattern, query, re.IGNORECASE)
         if matches:
-            parsed["parameters"]["employee_id"] = matches[0]
-            break
+            # Prioritize non-requester_id if both requester_id and another ID are mentioned.
+            # This handles cases like "compare my info with EMP123" - target is EMP123.
+            # If multiple IDs are found, take the first one that is not the requester_id,
+            # or the first one if none match requester_id, or requester_id if it's the only one.
 
-    # Look for names
-    name_pattern = r'\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b'
-    name_matches = re.findall(name_pattern, query)
-    if name_matches:
-        parsed["parameters"]["name"] = name_matches[0]
+            # Simple approach: take the first found ID.
+            # More complex disambiguation might be needed for multiple different IDs in a query.
+            found_id = matches[0]
+            if requester_id and found_id.lower() == requester_id.lower():
+                # If the found ID is the requester's ID, it could be part of a self-query.
+                # We will handle self-query explicitly later if no other target is found.
+                pass # Don't mark target_identified yet, let self-query logic handle it if no other target.
+            else:
+                parsed["parameters"]["employee_id"] = found_id
+                target_identified = True
+                break
 
-    # Check for self-referential queries
-    self_indicators = [r'\bmy\b', r'\bi\s+', r'\bme\b']
-    if any(re.search(indicator, query.lower()) for indicator in self_indicators):
-        if requester_id:
+    # 2. If no explicit ID, look for names
+    if not target_identified:
+        # Attempt to find two-part names first (e.g., "John Smith")
+        name_pattern_full = r'\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b'
+        name_matches_full = re.findall(name_pattern_full, query)
+        if name_matches_full:
+            parsed["parameters"]["name"] = name_matches_full[0]
+            target_identified = True
+        else:
+            # If no full name, look for single capitalized names (e.g., "Ann")
+            # This is more ambiguous, so use with caution or specific intent checks.
+            # For "Ann's salary", "Ann" is the target.
+            # Regex to find a single capitalized word that might be a name,
+            # especially if followed by 's or possessive, or near keywords like "salary for Ann"
+            # This simple regex might be too broad; consider refining if it causes issues.
+            name_pattern_single = r'\b([A-Z][a-z]+)\b(?:(?:\'s)?|\s+(?:details|info|salary|data|for))'
+            name_matches_single = re.findall(name_pattern_single, query)
+            if name_matches_single:
+                 # Check if this single name is not a self-query keyword like "My"
+                if name_matches_single[0].lower() not in ['my', 'i', 'me']:
+                    parsed["parameters"]["name"] = name_matches_single[0]
+                    target_identified = True
+
+    # 3. If no other target identified, check for self-referential queries
+    if not target_identified:
+        self_indicators = [r'\bmy\b', r'\bmi\b', r'\bmyself\b', r'\bi\b', r'\bme\b'] # Added more robust "me" with \b
+        is_self_query_indicator = any(re.search(indicator, query.lower()) for indicator in self_indicators)
+
+        if is_self_query_indicator and requester_id:
             parsed["parameters"]["employee_id"] = requester_id
             parsed["parameters"]["is_self_query"] = True
+            target_identified = True # Target is self
 
-    # Determine intent based on keywords
+    # If an employee_id was set (either explicit or self-query), and it matches requester_id,
+    # it's definitely a self_query.
+    if parsed["parameters"].get("employee_id") == requester_id and requester_id is not None:
+        parsed["parameters"]["is_self_query"] = True
+
+
+    # Determine intent based on keywords - this can be independent of target identification
+    # but might use the identified target to refine intent.
     if any(word in query.lower() for word in ['salary', 'pay', 'compensation']):
         parsed["intent"] = "get_salary_info"
         parsed["data_requested"].append("salary")
